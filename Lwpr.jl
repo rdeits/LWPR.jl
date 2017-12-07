@@ -2,43 +2,13 @@ module Lwpr
 
 using Parameters
 
-# @with_kw LwprParams
-
-
-# struct Model
-
-# @with_kw mutable struct ReceptiveField{T}
-#     α::Matrix{T}
-#     β::Vector{T}
-#     β0::Vetor{T}
-#     c::Vector{T}
-#     D::Matrix{T}
-#     H::Vector{T}
-#     λ::Vector{T}
-#     M::Matrix{T}
-#     mean_x::Vector{T}
-#     n_data::T
-#     P::Matrix{T}
-#     r::Vector{T}
-#     s::Vector{T}
-#     SSp::T
-#     SSs2::Vector{T}
-#     SSXres::Matrix{T}
-#     SSYres::Matrix{T}
-#     sum_e2::T
-#     sum_e_cv2::Vector{T}
-#     sum_w::Vector{T}
-#     SxresYres::Matrix{T}
-#     trustworthy::Bool
-#     U::Matrix{T}
-#     var_x::Vector{T}
-# end
-
 @with_kw struct RFParams{T}
-    λ::T
-    D_def{T}
+    λ::T = 0.999
+    D_def{Matrix{T}}
+    γ::T = 1e-4
+    α::T = 40
+    w_gen::T = 0.1
 end
-
 
 mutable struct Projection{T}
     u::Vector{T}
@@ -49,8 +19,9 @@ mutable struct Projection{T}
     SSE::T
     β::T
     p::Vector{T}
-    H::T # TODO: is this a scalar? why is it bold in the paper?
-    R::T # TODO: is this a scalar? why is it bold in the paper?
+    E::T
+    H::T
+    R::T
 
     function Projection{T}(N) where T
         p = new{T}()
@@ -62,10 +33,12 @@ mutable struct Projection{T}
         p.SSE = zero(T)
         p.β = zero(T)
         p.p = zeros(T, N)
+        p.E = zero(T)
+        p.H = zero(T)
+        p.R = zero(T)
         p
     end
 end
-
 
 mutable struct ReceptiveField{T}
     params::RFParams{T}
@@ -74,8 +47,9 @@ mutable struct ReceptiveField{T}
     D::Matrix{T}   # distance metric
     c::Vector{T}   # center of distribution
     W::T  # running total weight seen
-    E::T
     projections::Vector{Projection{T}}
+    M::UpperTriangular{T, Matrix{T}}
+    ∂J∂M::UpperTriangular{T, Matrix{T}}
 
     function ReceptiveField{T}(c::AbstractVector, Nout, params::RFParams) where T
         rf = new{T}(params)
@@ -85,8 +59,10 @@ mutable struct ReceptiveField{T}
         rf.D = copy(params.D_def)
         rf.c = copy(c)
         rf.W = zero(T)
-        rf.E = zero(T)
         rf.projections = [Projection{T}(N) for i in 1:2]
+        C = cholfact(rf.D)
+        rf.M = C[:U]
+        rf.∂J∂M = UpperTriangular(zeros(N, N))
         rf
     end
 end
@@ -125,11 +101,57 @@ function _update_local_model!(rf::ReceptiveField{T}, residuals::Vector{T}, x::Ab
 end
 
 function _update_distance_metric!(rf::ReceptiveField{T}, residuals::Vector{T}, x::AbstractVector{T}, y::T, w) where T
-    # note that W has already been updated to W^{n+1} in _update_means!()
+    @unpack λ, α, γ = rf.params
+    ΣΣ∂J1∂w = zero(T)
     for k in eachindex(rf.projections)
-        rf.E = λ * rf.E + w * residuals[k]^2 # residuals[k] corresponds to res_{k-1} in the paper
+        proj = rf.projections[k]
+        # note that W has already been updated to W^{n+1} in _update_means!()
+        proj.E = λ * proj.E + w * residuals[k]^2 # residuals[k] corresponds to res_{k-1} in the paper
+        ΣΣ∂J1∂w += -E/rf.W^2 + 1/rf.W * (residuals[k]^2 - 2 * residuals[k + 1] * proj.s / proj.SS * proj.H - 2 * (proj.s / proj.SS)^2 * proj.R)
+        h = w * proj.s^2 / proj.SS
+        proj.H = λ * proj.H + w * proj.s * residuals[k] / (1 - h)
+        proj.R = λ * proj.R + w^2 * residuals[k]^2 * proj.s^2 / (1 - h)
+    end
+    wJ2 = w / (rf.n * rf.W)
 
+    n = size(rf.D, 1)
+    Δx = x - rf.c
+    for l in 1:n
+        for r in 1:j
+            ∂D∂Mrl = zeros(T, n, n)
+            for j in 1:n
+                for i in 1:n
+                    if j == l
+                        ∂D∂Mrl[i, j] += rf.M[r, i]
+                    end
+                    if i == l
+                        ∂D∂Mrl[i, j] += rf.M[r, j]
+                    end
+                end
+            end
+            ∂w∂Mrl = -0.5 * w * Δx' * ∂D∂Mrl * Δx
+            ∂J1∂Mrl = ∂w∂Mrl * ΣΣ∂J1∂w
 
+            ∂J2∂Mrl = zero(T)
+            for j in 1:n
+                for i in 1:n
+                    if j == l
+                        ∂J2∂Mrl += rf.D[i, j] * rf.M[r, i]
+                    end
+                    if i == l
+                        ∂J2∂Mrl += rf.D[i, j] * rf.M[r, j]
+                    end
+                end
+            end
+            ∂J2∂Mrl *= 2 * γ
+
+            rf.∂J∂M[r, l] = ∂J1∂Mrl + ∂J2∂Mrl
+        end
+    end
+
+    @.(rf.M -= α * rf.∂J∂M)
+    rf.D = rf.M' * rf.M
+end
 
 function predict(rf::ReceptiveField, x)
     y = rf.β0
@@ -142,14 +164,16 @@ function predict(rf::ReceptiveField, x)
     return y
 end
 
-
-
 function update!(rf::ReceptiveField{T}, x::AbstractVector{T}, y::T, w) where T
     _update_means!(rf, x, y, w)
     residuals = zeros(length(rf.projections) + 1) # TODO: pre-allocate
     _update_local_model!(rf, residuals, x, y, w)
     _update_distance_metric!(rf, residuals, x, y, w)
 end
+
+struct Model{T}
+
+    fields::Vector{ReceptiveField{T}}
 
 
 
